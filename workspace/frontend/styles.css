@@ -164,3 +164,24 @@ textarea { width: 100%; font-family: ui-monospace, monospace; margin: 8px 0; }
 .logline .kind { color: var(--accent); margin-right: 10px; font-weight: 700; }
 .commit-note { background: #2a2016; border: 1px solid #6e4d24; border-radius: 8px;
                padding: 8px 12px; margin: 8px 0; }
+
+/* ---------- 上下文标识 / 推演沙盘 ---------- */
+.ctx-pill { padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 700;
+            letter-spacing: .03em; }
+.ctx-pill.live { background: #1e3d2e; color: var(--green); border: 1px solid #2e6b4a; }
+.ctx-pill.branch { background: #3a2c58; color: #d7c8ff; border: 1px solid #6f55b0; }
+.ctx-bar { padding: 9px 18px; font-size: 13px; display: flex; justify-content: space-between;
+           align-items: center; gap: 12px; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+.ctx-bar.live { display: none; }
+.ctx-bar.branch { background: linear-gradient(90deg, #241c3a, #1a1430); }
+.tab.has-branch { color: #c9b3ff; }
+.plan-card.selected { border-color: var(--purple); box-shadow: 0 0 0 1px var(--purple); }
+.ctx-text-active { color: var(--blue); }
+.ctx-text-promoted { color: var(--green); }
+.ctx-text-discarded { color: var(--muted); }
+
+/* 分支上下文中隐藏“写实战”的控件，防止误操作污染实战 */
+body.ctx-branch #resetBtn, body.ctx-branch #importBtn,
+body.ctx-branch #hAdd, body.ctx-branch #publishBtn,
+body.ctx-branch #planBtn, body.ctx-branch #replanBtn,
+body.ctx-branch .depart-live { display: none !important; }

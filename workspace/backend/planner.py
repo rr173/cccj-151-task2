@@ -93,13 +93,20 @@ def k_paths(adj, src, dst, k=3):
 # ---------------------------------------------------------------- 状态快照
 
 class Snapshot:
-    def __init__(self, db):
+    def __init__(self, db, world="live"):
+        self.world = world
         c = db.conn
-        self.grids = {r["code"]: dict(r) for r in c.execute("SELECT * FROM grids")}
-        self.shelters = {r["code"]: dict(r) for r in c.execute("SELECT * FROM shelters")}
-        self.roads = {r["code"]: dict(r) for r in c.execute("SELECT * FROM roads")}
-        self.vehicles = {r["code"]: dict(r) for r in c.execute("SELECT * FROM vehicles")}
-        self.households = {r["ref"]: dict(r) for r in c.execute("SELECT * FROM households")}
+        w = (world,)
+        self.grids = {r["code"]: dict(r) for r in c.execute(
+            "SELECT * FROM grids WHERE world_id=?", w)}
+        self.shelters = {r["code"]: dict(r) for r in c.execute(
+            "SELECT * FROM shelters WHERE world_id=?", w)}
+        self.roads = {r["code"]: dict(r) for r in c.execute(
+            "SELECT * FROM roads WHERE world_id=?", w)}
+        self.vehicles = {r["code"]: dict(r) for r in c.execute(
+            "SELECT * FROM vehicles WHERE world_id=?", w)}
+        self.households = {r["ref"]: dict(r) for r in c.execute(
+            "SELECT * FROM households WHERE world_id=?", w)}
         self.adj, self.open_roads = build_graph(
             [r for r in self.roads.values() if r["status"] == "open"]
         )
@@ -111,8 +118,9 @@ class Snapshot:
             SELECT a.household_ref AS ref, b.shelter_code AS shelter,
                    b.vehicle_code AS vehicle, b.wave AS wave
             FROM assignments a JOIN batches b ON a.batch_id = b.id
-            WHERE b.status = 'departed'
-            """
+            WHERE b.status = 'departed' AND a.world_id=? AND b.world_id=?
+            """,
+            (world, world),
         )
         for r in rows:
             self.locked[r["ref"]] = dict(r)
@@ -130,8 +138,13 @@ class Snapshot:
         for ref, info in self.locked.items():
             self.committed_beds[info["shelter"]] += self.households[ref]["members"]
 
-        # 已离场车辆不可再用
-        self.locked_vehicles = {info["vehicle"] for info in self.locked.values()}
+        # 已离场且“当前仍处于离场状态”的车辆不可再用。
+        # 实战中车辆离场后状态永久为 departed；推演模拟里车辆折返会被重置为
+        # available，此时其历史批次仍锁定人员与床位，但车辆本身可再次参与运输。
+        self.locked_vehicles = {
+            info["vehicle"] for info in self.locked.values()
+            if self.vehicles.get(info["vehicle"], {}).get("status") == "departed"
+        }
 
         # 预计算每个网格 → 每个避难点的候选路径
         self.paths = {}  # (grid, shelter) -> [(dist, nodes, edges)]

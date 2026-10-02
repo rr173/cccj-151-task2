@@ -10,6 +10,7 @@
 <header>
   <div class="brand">🔥 山火应急撤离编排</div>
   <nav>
+    <button data-tab="branch" class="tab">推演沙盘</button>
     <button data-tab="map" class="tab active">作战地图</button>
     <button data-tab="batches" class="tab">撤离批次</button>
     <button data-tab="plans" class="tab">方案比较与发布</button>
@@ -18,13 +19,85 @@
     <button data-tab="log" class="tab">事件日志</button>
   </nav>
   <div class="revbox">
+    <span id="ctxPill" class="ctx-pill live">实战 LIVE</span>
     <span>修订号 <b id="revision">–</b></span>
     <span id="revWarn" class="rev-warn" hidden>数据已更新</span>
     <button id="refreshBtn" class="mini">刷新</button>
   </div>
 </header>
 
+<div id="ctxBar" class="ctx-bar live" hidden>
+  <span id="ctxBarText"></span>
+  <button id="exitBranchBtn" class="mini">返回实战上下文</button>
+</div>
+
 <main>
+  <!-- ============ 推演沙盘 ============ -->
+  <section id="tab-branch" class="tabpanel">
+    <div class="card">
+      <div class="row-between">
+        <h2>隔离推演分支（what-if 沙盘）</h2>
+        <div class="form-inline">
+          <input id="brName" placeholder="分支名称" class="inp" style="width:200px">
+          <input id="brCommander" placeholder="值班员代号" class="inp small">
+          <button id="brCreateBtn" class="primary">从当前实战创建推演分支</button>
+        </div>
+      </div>
+      <p class="muted">分支会复制当前实战（路网/运力/收容/家庭与<b>已承诺状态</b>）形成独立世界；
+        之后所有封路、故障、暂停、改容量/床位与连续模拟都只发生在分支内，<b>绝不写入实战</b>。
+        创建后实战与推演可各自推进；提升时按创建基线做三方冲突检查。</p>
+      <div id="branchList" class="plan-cards"></div>
+    </div>
+
+    <div id="branchConsole" class="card" hidden>
+      <div class="row-between">
+        <h2 id="brTitle">分支控制台</h2>
+        <div>
+          <button id="brTickBtn" class="primary">推进 1 个模拟时钟</button>
+          <input id="brTickN" type="number" min="1" value="1" class="inp xs" title="连续推进时钟数">
+          <button id="brDiffBtn" class="mini">并排差异</button>
+          <button id="brCheckBtn" class="mini">提升预检</button>
+          <button id="brPromoteBtn" class="publish">提升推演资源改动</button>
+          <button id="brDiscardBtn" class="danger mini">废弃分支</button>
+        </div>
+      </div>
+      <div id="brMeta" class="muted" style="margin:6px 0"></div>
+
+      <div class="import-grid" style="grid-template-columns: 1fr 1.4fr">
+        <div>
+          <h3>注入推演事件（进入待执行队列，下个时钟生效）</h3>
+          <div class="form-inline">
+            <select id="brEvType">
+              <option value="road_close">封闭道路</option>
+              <option value="road_open">恢复道路</option>
+              <option value="road_set_capacity">设置道路容量</option>
+              <option value="vehicle_down">车辆故障</option>
+              <option value="vehicle_recovered">车辆恢复</option>
+              <option value="shelter_suspend">暂停避难点</option>
+              <option value="shelter_resume">恢复避难点</option>
+              <option value="shelter_set_beds">设置避难点床位</option>
+              <option value="fire_expand">火线扩大</option>
+              <option value="fire_clear">网格解除威胁</option>
+            </select>
+            <select id="brEvCode"></select>
+            <input id="brEvVal" type="number" class="inp xs" placeholder="数值" hidden>
+            <button id="brEvAddBtn" class="mini">入队</button>
+          </div>
+          <div id="brPending" class="muted"></div>
+          <h3>模拟结果（逐时钟）</h3>
+          <div id="brSteps"></div>
+        </div>
+        <div>
+          <h3>并排差异：分支 vs 实战</h3>
+          <div id="brDiff"></div>
+        </div>
+      </div>
+      <div id="brPromote" style="margin-top:10px"></div>
+      <h3>分支审计</h3>
+      <div id="brAudit"></div>
+    </div>
+  </section>
+
   <!-- ============ 地图 ============ -->
   <section id="tab-map" class="tabpanel active">
     <div class="layout">

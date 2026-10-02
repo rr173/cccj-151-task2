@@ -1,4 +1,4 @@
-"""演示场景种子数据（重复执行幂等：按主键 upsert）。
+"""演示场景种子数据（重复执行幂等：按 (world_id, code/ref) upsert）。
 
 布局（x,y 为地图坐标）：
 
@@ -16,15 +16,22 @@
 """
 import time
 
+LIVE = "live"
 
-def seed(db, reset=False):
+
+def seed(db, reset=False, world=LIVE):
+    """把演示数据写入指定世界。
+
+    reset=True 时只清空该世界（保留分支元数据与其他世界），并把世界修订号归零。
+    网格/道路/避难点/车辆按编号 upsert；家庭按户号去重，不覆盖已有登记。
+    """
     with db.lock:
         c = db.conn
         if reset:
             for t in ("assignments", "batches", "orders", "plans", "event_log",
                       "households", "vehicles", "roads", "shelters", "grids"):
-                c.execute(f"DELETE FROM {t}")
-            c.execute("UPDATE meta SET value='0' WHERE key='revision'")
+                c.execute(f"DELETE FROM {t} WHERE world_id=?", (world,))
+            db.set_meta(f"revision:{world}", "0")
 
         grids = [
             ("G1", "云顶村北", 1.0, 3.0, 1),
@@ -35,9 +42,10 @@ def seed(db, reset=False):
             ("G6", "河岸", 5.6, 1.2, 1),
         ]
         c.executemany(
-            "INSERT INTO grids(code,name,x,y,threatened) VALUES(?,?,?,?,?) "
-            "ON CONFLICT(code) DO UPDATE SET name=excluded.name,x=excluded.x,y=excluded.y",
-            grids,
+            "INSERT INTO grids(world_id,code,name,x,y,threatened) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(world_id,code) DO UPDATE SET name=excluded.name,"
+            "x=excluded.x,y=excluded.y,threatened=excluded.threatened",
+            [(world, *g) for g in grids],
         )
 
         shelters = [
@@ -47,9 +55,12 @@ def seed(db, reset=False):
             ("S4", "镇礼堂",     7.2, 4.3, 20, 0, 1, "suspended"),
         ]
         c.executemany(
-            "INSERT INTO shelters(code,name,x,y,beds,accessible,pets_allowed,status)"
-            " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(code) DO UPDATE SET name=excluded.name",
-            shelters,
+            "INSERT INTO shelters(world_id,code,name,x,y,beds,accessible,pets_allowed,status)"
+            " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(world_id,code) DO UPDATE SET"
+            " name=excluded.name,x=excluded.x,y=excluded.y,beds=excluded.beds,"
+            " accessible=excluded.accessible,pets_allowed=excluded.pets_allowed,"
+            " status=excluded.status",
+            [(world, *s) for s in shelters],
         )
 
         roads = [
@@ -66,10 +77,11 @@ def seed(db, reset=False):
             ("r11", "G6", "S3", 4.2, 2, "open"),
         ]
         c.executemany(
-            "INSERT INTO roads(code,a,b,length,capacity,status) VALUES(?,?,?,?,?,?) "
-            "ON CONFLICT(code) DO UPDATE SET a=excluded.a,b=excluded.b,"
-            "length=excluded.length,capacity=excluded.capacity",
-            roads,
+            "INSERT INTO roads(world_id,code,a,b,length,capacity,status)"
+            " VALUES(?,?,?,?,?,?,?) ON CONFLICT(world_id,code) DO UPDATE SET a=excluded.a,"
+            "b=excluded.b,length=excluded.length,capacity=excluded.capacity,"
+            "status=excluded.status",
+            [(world, *r) for r in roads],
         )
 
         vehicles = [
@@ -80,10 +92,10 @@ def seed(db, reset=False):
             ("V5", "小巴-05", 5, 0),
         ]
         c.executemany(
-            "INSERT INTO vehicles(code,name,seats,accessible,status)"
-            " VALUES(?,?,?,?,'available') ON CONFLICT(code) DO UPDATE SET"
+            "INSERT INTO vehicles(world_id,code,name,seats,accessible,status)"
+            " VALUES(?,?,?,?,?, 'available') ON CONFLICT(world_id,code) DO UPDATE SET"
             " name=excluded.name,seats=excluded.seats,accessible=excluded.accessible",
-            vehicles,
+            [(world, *v) for v in vehicles],
         )
 
         # ref, 姓名, 网格, 人数, 行动辅助, 宠物, 联络
@@ -101,9 +113,9 @@ def seed(db, reset=False):
             ("H11", "郑家", "G6", 3, 0, 0, "138-0011"),
         ]
         c.executemany(
-            "INSERT OR IGNORE INTO households(ref,name,grid,members,mobility,pets,contact)"
-            " VALUES(?,?,?,?,?,?,?)",
-            households,
+            "INSERT OR IGNORE INTO households(world_id,ref,name,grid,members,mobility,pets,contact)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            [(world, *h) for h in households],
         )
 
         db.commit()

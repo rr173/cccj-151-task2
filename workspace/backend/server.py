@@ -16,13 +16,16 @@ from urllib.parse import urlparse
 from db import DB
 from planner import Snapshot, plan as run_plan, validate_plan
 from seed import seed
+import branches
 
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")
 DB_PATH = os.environ.get("EVAC_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                 "..", "data", "evac.db"))
 
+LIVE = branches.LIVE
+
 db = DB(DB_PATH)
-if os.environ.get("EVAC_NO_SEED") != "1" and db.revision() == 0 and not db.get_meta("seeded"):
+if os.environ.get("EVAC_NO_SEED") != "1" and db.revision(LIVE) == 0 and not db.get_meta("seeded"):
     seed(db)
     db.set_meta("seeded", "1")
 
@@ -33,46 +36,62 @@ def now_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
-def rows(table):
-    return [dict(r) for r in db.conn.execute(f"SELECT * FROM {table}")]
+def rows(table, world=LIVE):
+    return [dict(r) for r in db.conn.execute(
+        f"SELECT * FROM {table} WHERE world_id=?", (world,))]
 
 
-def release_scheduled_batches(where_sql, params=(), reason=""):
+def release_scheduled_batches(where_sql, params=(), reason="", world=LIVE):
     """取消未出发的计划批次并释放其预占资源（已出发批次永不动）。
 
     返回被释放的家庭 ref 列表。
     """
     cur = db.conn.execute(
-        f"SELECT id FROM batches WHERE status='scheduled' AND {where_sql}", params)
+        f"SELECT id FROM batches WHERE world_id=? AND status='scheduled' AND {where_sql}",
+        (world, *params))
     batch_ids = [r["id"] for r in cur]
     released = []
     for bid in batch_ids:
         hs = [r["household_ref"] for r in db.conn.execute(
-            "SELECT household_ref FROM assignments WHERE batch_id=?", (bid,))]
+            "SELECT household_ref FROM assignments WHERE world_id=? AND batch_id=?",
+            (world, bid))]
         released.extend(hs)
-        db.conn.execute("DELETE FROM assignments WHERE batch_id=?", (bid,))
-        db.conn.execute("UPDATE batches SET status='cancelled' WHERE id=?", (bid,))
+        db.conn.execute("DELETE FROM assignments WHERE world_id=? AND batch_id=?",
+                        (world, bid))
+        db.conn.execute("UPDATE batches SET status='cancelled' WHERE world_id=? AND id=?",
+                        (world, bid))
     if batch_ids:
-        db.log_event("batch_cancelled",
-                     json.dumps({"batches": batch_ids, "released": released,
-                                 "reason": reason}, ensure_ascii=False))
+        db.log_event(world, "batch_cancelled",
+                     {"batches": batch_ids, "released": released, "reason": reason})
     return released
 
 
 # ---------------------------------------------------------------- 状态视图
 
 def build_state():
-    c = db.conn
-    grids = {r["code"]: dict(r) for r in c.execute("SELECT * FROM grids")}
-    shelters = {r["code"]: dict(r) for r in c.execute("SELECT * FROM shelters")}
-    vehicles = {r["code"]: dict(r) for r in c.execute("SELECT * FROM vehicles")}
-    roads = rows("roads")
-    households = {r["ref"]: dict(r) for r in c.execute("SELECT * FROM households")}
+    return build_state_for(db, LIVE)
+
+
+def build_state_for(db_, world):
+    """构造指定世界（实战 live 或某推演分支）的全量态势视图。"""
+    c = db_.conn
+    grids = {r["code"]: dict(r) for r in c.execute(
+        "SELECT * FROM grids WHERE world_id=?", (world,))}
+    shelters = {r["code"]: dict(r) for r in c.execute(
+        "SELECT * FROM shelters WHERE world_id=?", (world,))}
+    vehicles = {r["code"]: dict(r) for r in c.execute(
+        "SELECT * FROM vehicles WHERE world_id=?", (world,))}
+    roads = [dict(r) for r in c.execute(
+        "SELECT * FROM roads WHERE world_id=?", (world,))]
+    households = {r["ref"]: dict(r) for r in c.execute(
+        "SELECT * FROM households WHERE world_id=?", (world,))}
 
     # 批次 + 安置
     batch_rows = c.execute(
-        "SELECT * FROM batches ORDER BY order_id, seq").fetchall()
-    assignment_rows = c.execute("SELECT * FROM assignments").fetchall()
+        "SELECT * FROM batches WHERE world_id=? ORDER BY order_id, seq",
+        (world,)).fetchall()
+    assignment_rows = c.execute(
+        "SELECT * FROM assignments WHERE world_id=?", (world,)).fetchall()
     hh_by_batch = {}
     for a in assignment_rows:
         hh_by_batch.setdefault(a["batch_id"], []).append(a["household_ref"])
@@ -108,7 +127,8 @@ def build_state():
         })
 
     orders = [dict(r) for r in c.execute(
-        "SELECT id,plan_id,commander,revision,created_at FROM orders ORDER BY created_at")]
+        "SELECT id,plan_id,commander,revision,created_at FROM orders "
+        "WHERE world_id=? ORDER BY created_at", (world,))]
 
     capacity = {}
     for code, s in shelters.items():
@@ -123,18 +143,22 @@ def build_state():
         }
 
     events = [dict(r) for r in c.execute(
-        "SELECT id,ts,kind,detail,revision FROM event_log ORDER BY id DESC LIMIT 50")]
+        "SELECT id,ts,kind,detail,revision FROM event_log WHERE world_id=? "
+        "ORDER BY id DESC LIMIT 50", (world,))]
 
     pending = [ref for ref, st in hh_state.items()
                if st["status"] == "unplanned"
                and grids.get(households[ref]["grid"], {}).get("threatened")]
 
     return {
-        "revision": db.revision(),
+        "world": world,
+        "revision": db_.revision(world),
         "grids": list(grids.values()),
-        "shelters": [dict(r) for r in c.execute("SELECT * FROM shelters")],
+        "shelters": [dict(r) for r in c.execute(
+            "SELECT * FROM shelters WHERE world_id=?", (world,))],
         "roads": roads,
-        "vehicles": [dict(r) for r in c.execute("SELECT * FROM vehicles")],
+        "vehicles": [dict(r) for r in c.execute(
+            "SELECT * FROM vehicles WHERE world_id=?", (world,))],
         "households": list(households.values()),
         "household_state": hh_state,
         "batches": batches_out,
@@ -148,34 +172,34 @@ def build_state():
 # ---------------------------------------------------------------- 事务操作
 
 def import_entities(kind, items):
-    """通用导入：按主键 upsert，重复导入不产生重复数据。"""
+    """通用导入：按主键 upsert，重复导入不产生重复数据。（写入实战世界）"""
     if not isinstance(items, list):
         raise ValueError("载荷必须是数组")
     specs = {
         "grids": ("grids", ["code", "name", "x", "y"],
-                  "INSERT INTO grids(code,name,x,y,threatened) VALUES(?,?,?,?,1) "
-                  "ON CONFLICT(code) DO UPDATE SET name=excluded.name,x=excluded.x,y=excluded.y",
-                  lambda it: (it["code"], it["name"], it["x"], it["y"])),
+                  "INSERT INTO grids(world_id,code,name,x,y,threatened) VALUES(?,?,?,?,?,1) "
+                  "ON CONFLICT(world_id,code) DO UPDATE SET name=excluded.name,x=excluded.x,y=excluded.y",
+                  lambda it: (LIVE, it["code"], it["name"], it["x"], it["y"])),
         "shelters": ("shelters", ["code", "name", "x", "y", "beds"],
-                     "INSERT INTO shelters(code,name,x,y,beds,accessible,pets_allowed,status)"
-                     " VALUES(?,?,?,?,?,?,?,'active') ON CONFLICT(code) DO UPDATE SET"
+                     "INSERT INTO shelters(world_id,code,name,x,y,beds,accessible,pets_allowed,status)"
+                     " VALUES(?,?,?,?,?,?,?,?,'active') ON CONFLICT(world_id,code) DO UPDATE SET"
                      " name=excluded.name,x=excluded.x,y=excluded.y,beds=excluded.beds,"
                      " accessible=excluded.accessible,pets_allowed=excluded.pets_allowed",
-                     lambda it: (it["code"], it["name"], it["x"], it["y"],
+                     lambda it: (LIVE, it["code"], it["name"], it["x"], it["y"],
                                  int(it["beds"]), int(it.get("accessible", 0)),
                                  int(it.get("pets_allowed", 1)))),
         "roads": ("roads", ["code", "a", "b"],
-                  "INSERT INTO roads(code,a,b,length,capacity,status)"
-                  " VALUES(?,?,?,?,?,'open') ON CONFLICT(code) DO UPDATE SET a=excluded.a,"
+                  "INSERT INTO roads(world_id,code,a,b,length,capacity,status)"
+                  " VALUES(?,?,?,?,?,?,'open') ON CONFLICT(world_id,code) DO UPDATE SET a=excluded.a,"
                   "b=excluded.b,length=excluded.length,capacity=excluded.capacity",
-                  lambda it: (it["code"], it["a"], it["b"],
+                  lambda it: (LIVE, it["code"], it["a"], it["b"],
                               float(it.get("length", 1)),
                               int(it.get("capacity", 1)))),
         "vehicles": ("vehicles", ["code", "name", "seats"],
-                     "INSERT INTO vehicles(code,name,seats,accessible,status)"
-                     " VALUES(?,?,?,?,'available') ON CONFLICT(code) DO UPDATE SET"
+                     "INSERT INTO vehicles(world_id,code,name,seats,accessible,status)"
+                     " VALUES(?,?,?,?,?,'available') ON CONFLICT(world_id,code) DO UPDATE SET"
                      " name=excluded.name,seats=excluded.seats,accessible=excluded.accessible",
-                     lambda it: (it["code"], it["name"], int(it["seats"]),
+                     lambda it: (LIVE, it["code"], it["name"], int(it["seats"]),
                                  int(it.get("accessible", 0)))),
     }
     if kind not in specs:
@@ -188,9 +212,8 @@ def import_entities(kind, items):
                 raise ValueError(f"{kind} 记录缺少字段 {f}: {it}")
         payloads.append(conv(it))
     db.conn.executemany(sql, payloads)
-    rev = db.bump_revision()
-    db.log_event("import", json.dumps({"kind": kind, "count": len(items)},
-                                      ensure_ascii=False))
+    rev = db.bump_revision(LIVE)
+    db.log_event(LIVE, "import", {"kind": kind, "count": len(items)})
     db.commit()
     return {"imported": len(items), "revision": rev}
 
@@ -204,39 +227,39 @@ def register_households(items):
         for f in ("ref", "grid", "members"):
             if f not in it:
                 raise ValueError(f"家庭记录缺少字段 {f}")
-        exists = db.conn.execute("SELECT 1 FROM households WHERE ref=?",
-                                 (it["ref"],)).fetchone()
+        exists = db.conn.execute(
+            "SELECT 1 FROM households WHERE world_id=? AND ref=?",
+            (LIVE, it["ref"])).fetchone()
         if exists:
             skipped += 1
             continue
         db.conn.execute(
-            "INSERT INTO households(ref,name,grid,members,mobility,pets,contact)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (it["ref"], it.get("name", ""), it["grid"], int(it["members"]),
+            "INSERT INTO households(world_id,ref,name,grid,members,mobility,pets,contact)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (LIVE, it["ref"], it.get("name", ""), it["grid"], int(it["members"]),
              int(it.get("mobility", 0)), int(it.get("pets", 0)),
              it.get("contact", "")))
         inserted += 1
-    rev = db.bump_revision()
-    db.log_event("households_register",
-                 json.dumps({"inserted": inserted, "skipped": skipped},
-                            ensure_ascii=False))
+    rev = db.bump_revision(LIVE)
+    db.log_event(LIVE, "households_register",
+                 {"inserted": inserted, "skipped": skipped})
     db.commit()
     return {"inserted": inserted, "skipped_duplicates": skipped, "revision": rev}
 
 
 def create_plan(body):
     """计算候选方案（只包含受威胁网格中的未出发家庭）。不改动任何现有命令。"""
-    snap = Snapshot(db)
+    snap = Snapshot(db, LIVE)
     result = run_plan(snap)
     pid = now_id("plan")
     db.conn.execute(
-        "INSERT INTO plans(id,name,commander,base_revision,status,payload,created_at)"
-        " VALUES(?,?,?,?, 'candidate', ?,?)",
-        (pid, body.get("name", "候选方案"), body.get("commander", ""),
-         db.revision(), json.dumps(result, ensure_ascii=False), time.time()))
+        "INSERT INTO plans(world_id,id,name,commander,base_revision,status,payload,created_at)"
+        " VALUES(?,?,?,?,?, 'candidate', ?,?)",
+        (LIVE, pid, body.get("name", "候选方案"), body.get("commander", ""),
+         db.revision(LIVE), json.dumps(result, ensure_ascii=False), time.time()))
     db.commit()
     result["id"] = pid
-    result["revision"] = db.revision()
+    result["revision"] = db.revision(LIVE)
     return result
 
 
@@ -244,10 +267,11 @@ def list_plans():
     out = []
     for r in db.conn.execute(
             "SELECT id,name,commander,base_revision,status,created_at FROM plans"
-            " ORDER BY created_at DESC").fetchall():
+            " WHERE world_id=? ORDER BY created_at DESC", (LIVE,)).fetchall():
         d = dict(r)
         payload = json.loads(db.conn.execute(
-            "SELECT payload FROM plans WHERE id=?", (d["id"],)).fetchone()["payload"])
+            "SELECT payload FROM plans WHERE world_id=? AND id=?",
+            (LIVE, d["id"])).fetchone()["payload"])
         d["summary"] = {
             "feasible": payload["feasible"], "max_wave": payload["max_wave"],
             "totals": payload["totals"],
@@ -265,7 +289,8 @@ def publish_plan(pid, body):
     资源/路况已变化（或已有他人发布），返回 409，指挥员需基于最新方案重新比较发布。
     发布后：旧的"未出发"批次全部取消替换；"已出发"批次与床位占用原样保留。
     """
-    row = db.conn.execute("SELECT * FROM plans WHERE id=?", (pid,)).fetchone()
+    row = db.conn.execute("SELECT * FROM plans WHERE world_id=? AND id=?",
+                          (LIVE, pid)).fetchone()
     if not row:
         raise NotFound("方案不存在")
     if row["status"] == "published":
@@ -273,15 +298,15 @@ def publish_plan(pid, body):
     payload = json.loads(row["payload"])
     if not payload["feasible"]:
         raise Conflict("方案含无法安置的家庭，不能发布；请先恢复资源或调整约束")
-    if row["base_revision"] != db.revision():
+    if row["base_revision"] != db.revision(LIVE):
         raise Conflict(
-            f"方案已过期：制定于修订号 {row['base_revision']}，当前为 {db.revision()}，"
+            f"方案已过期：制定于修订号 {row['base_revision']}，当前为 {db.revision(LIVE)}，"
             "已有其他指挥员发布或资源状态发生变化，请基于最新方案重新发布")
     if not payload["batches"]:
         raise Conflict("方案为空（当前没有待撤离家庭）")
 
     # 发布前独立复核全部硬约束（基于当前最新快照，防止方案制定后资源已变）
-    violations = validate_plan(Snapshot(db), payload["batches"])
+    violations = validate_plan(Snapshot(db, LIVE), payload["batches"])
     if violations:
         raise Conflict("方案违反硬约束，禁止发布：" + "；".join(violations[:8])
                        + ("……" if len(violations) > 8 else ""))
@@ -290,28 +315,32 @@ def publish_plan(pid, body):
 
     # 替换所有未出发批次（已出发批次保持承诺不变）
     release_scheduled_batches("1=1", reason=f"发布新方案 {pid}")
-    db.conn.execute("UPDATE plans SET status='superseded' WHERE status='published'")
-    db.conn.execute("UPDATE plans SET status='published' WHERE id=?", (pid,))
+    db.conn.execute(
+        "UPDATE plans SET status='superseded' WHERE world_id=? AND status='published'",
+        (LIVE,))
+    db.conn.execute("UPDATE plans SET status='published' WHERE world_id=? AND id=?",
+                    (LIVE, pid))
 
     oid = now_id("order")
     db.conn.execute(
-        "INSERT INTO orders(id,plan_id,commander,revision,created_at) VALUES(?,?,?,?,?)",
-        (oid, pid, commander, db.revision(), time.time()))
+        "INSERT INTO orders(world_id,id,plan_id,commander,revision,created_at)"
+        " VALUES(?,?,?,?,?,?)",
+        (LIVE, oid, pid, commander, db.revision(LIVE), time.time()))
     for b in payload["batches"]:
         bid = now_id("batch")
         db.conn.execute(
-            "INSERT INTO batches(id,order_id,seq,wave,vehicle_code,grid,shelter_code,"
-            "route,status) VALUES(?,?,?,?,?,?,?,?, 'scheduled')",
-            (bid, oid, b["seq"], b["wave"], b["vehicle"], b["grid"], b["shelter"],
+            "INSERT INTO batches(world_id,id,order_id,seq,wave,vehicle_code,grid,shelter_code,"
+            "route,status) VALUES(?,?,?,?,?,?,?,?,?, 'scheduled')",
+            (LIVE, bid, oid, b["seq"], b["wave"], b["vehicle"], b["grid"], b["shelter"],
              json.dumps({"edges": b["route_edges"], "nodes": b["route_nodes"]})))
         for h in b["households"]:
             db.conn.execute(
-                "INSERT INTO assignments(batch_id,household_ref) VALUES(?,?)",
-                (bid, h["ref"]))
-    rev = db.bump_revision()
-    db.log_event("order_published",
-                 json.dumps({"order": oid, "plan": pid, "commander": commander,
-                             "batches": len(payload["batches"])}, ensure_ascii=False))
+                "INSERT INTO assignments(world_id,batch_id,household_ref) VALUES(?,?,?)",
+                (LIVE, bid, h["ref"]))
+    rev = db.bump_revision(LIVE)
+    db.log_event(LIVE, "order_published",
+                 {"order": oid, "plan": pid, "commander": commander,
+                  "batches": len(payload["batches"])})
     db.commit()
     return {"order_id": oid, "plan_id": pid, "revision": rev,
             "batches": len(payload["batches"])}
@@ -319,7 +348,8 @@ def publish_plan(pid, body):
 
 def depart_batch(bid, body):
     """车辆离场：批次与目的地床位占用即视为已承诺，后续重算不得再触碰。"""
-    b = db.conn.execute("SELECT * FROM batches WHERE id=?", (bid,)).fetchone()
+    b = db.conn.execute("SELECT * FROM batches WHERE world_id=? AND id=?",
+                        (LIVE, bid)).fetchone()
     if not b:
         raise NotFound("批次不存在")
     if b["status"] != "scheduled":
@@ -327,18 +357,18 @@ def depart_batch(bid, body):
 
     ts = time.time()
     db.conn.execute(
-        "UPDATE batches SET status='departed', departed_at=? WHERE id=?", (ts, bid))
-    db.conn.execute("UPDATE vehicles SET status='departed' WHERE code=?",
-                    (b["vehicle_code"],))
+        "UPDATE batches SET status='departed', departed_at=? WHERE world_id=? AND id=?",
+        (ts, LIVE, bid))
+    db.conn.execute("UPDATE vehicles SET status='departed' WHERE world_id=? AND code=?",
+                    (LIVE, b["vehicle_code"]))
     # 同一辆车后续的未出发波次已无法执行 → 取消并释放，等待重新编排
     released = release_scheduled_batches(
         "vehicle_code=? AND id<>?", (b["vehicle_code"], bid),
         reason=f"车辆 {b['vehicle_code']} 已离场")
-    rev = db.bump_revision()
-    db.log_event("batch_departed",
-                 json.dumps({"batch": bid, "vehicle": b["vehicle_code"],
-                             "shelter": b["shelter_code"], "released": released},
-                            ensure_ascii=False))
+    rev = db.bump_revision(LIVE)
+    db.log_event(LIVE, "batch_departed",
+                 {"batch": bid, "vehicle": b["vehicle_code"],
+                  "shelter": b["shelter_code"], "released": released})
     db.commit()
     return {"batch": bid, "status": "departed", "released_for_replan": released,
             "revision": rev}
@@ -347,81 +377,88 @@ def depart_batch(bid, body):
 def apply_event(body):
     """火线扩大 / 道路封闭与恢复 / 车辆故障与恢复 / 避难点暂停与恢复。
 
-    任何事件都只影响未出发批次；已出发承诺不变。
+    任何事件都只影响实战世界的未出发批次；已出发承诺不变。
     """
     kind = body.get("type", "")
-    rev_before = db.revision()
     released = []
 
     def get(table, code):
-        r = db.conn.execute(f"SELECT * FROM {table} WHERE code=?", (code,)).fetchone()
+        r = db.conn.execute(f"SELECT * FROM {table} WHERE world_id=? AND code=?",
+                            (LIVE, code)).fetchone()
         if not r:
             raise NotFound(f"{table} 中不存在 {code}")
         return dict(r)
 
     if kind == "road_close":
         get("roads", body["code"])
-        db.conn.execute("UPDATE roads SET status='closed' WHERE code=?", (body["code"],))
-        released = _cancel_batches_on_road(body["code"],
-                                           f"道路封闭 {body['code']}")
+        db.conn.execute("UPDATE roads SET status='closed' WHERE world_id=? AND code=?",
+                        (LIVE, body["code"]))
+        released = _cancel_batches_on_road(body["code"], f"道路封闭 {body['code']}")
     elif kind == "road_open":
         get("roads", body["code"])
-        db.conn.execute("UPDATE roads SET status='open' WHERE code=?", (body["code"],))
+        db.conn.execute("UPDATE roads SET status='open' WHERE world_id=? AND code=?",
+                        (LIVE, body["code"]))
     elif kind == "vehicle_down":
         get("vehicles", body["code"])
-        db.conn.execute("UPDATE vehicles SET status='down' WHERE code=?", (body["code"],))
+        db.conn.execute("UPDATE vehicles SET status='down' WHERE world_id=? AND code=?",
+                        (LIVE, body["code"]))
         released = release_scheduled_batches(
             "vehicle_code=?", (body["code"],), reason=f"车辆故障 {body['code']}")
     elif kind == "vehicle_recovered":
         get("vehicles", body["code"])
         db.conn.execute(
-            "UPDATE vehicles SET status='available' WHERE code=? AND status<>'departed'",
-            (body["code"],))
+            "UPDATE vehicles SET status='available' WHERE world_id=? AND code=?"
+            " AND status<>'departed'", (LIVE, body["code"]))
     elif kind == "shelter_suspend":
         get("shelters", body["code"])
-        db.conn.execute("UPDATE shelters SET status='suspended' WHERE code=?",
-                        (body["code"],))
+        db.conn.execute("UPDATE shelters SET status='suspended' WHERE world_id=? AND code=?",
+                        (LIVE, body["code"]))
         released = release_scheduled_batches(
             "shelter_code=?", (body["code"],),
             reason=f"避难点暂停接收 {body['code']}")
     elif kind == "shelter_resume":
         get("shelters", body["code"])
-        db.conn.execute("UPDATE shelters SET status='active' WHERE code=?",
-                        (body["code"],))
+        db.conn.execute("UPDATE shelters SET status='active' WHERE world_id=? AND code=?",
+                        (LIVE, body["code"]))
     elif kind == "fire_expand":
-        r = get("grids", body["code"])
-        db.conn.execute("UPDATE grids SET threatened=1 WHERE code=?", (body["code"],))
+        get("grids", body["code"])
+        db.conn.execute("UPDATE grids SET threatened=1 WHERE world_id=? AND code=?",
+                        (LIVE, body["code"]))
         if body.get("close_roads"):
             for rc in body["close_roads"]:
-                db.conn.execute("UPDATE roads SET status='closed' WHERE code=?", (rc,))
+                db.conn.execute("UPDATE roads SET status='closed' WHERE world_id=? AND code=?",
+                                (LIVE, rc))
                 released += _cancel_batches_on_road(rc, f"火线扩大封路 {rc}")
     elif kind == "fire_clear":
         get("grids", body["code"])
-        db.conn.execute("UPDATE grids SET threatened=0 WHERE code=?", (body["code"],))
+        db.conn.execute("UPDATE grids SET threatened=0 WHERE world_id=? AND code=?",
+                        (LIVE, body["code"]))
     else:
         raise ValueError(f"未知事件类型 {kind}")
 
-    rev = db.bump_revision()
-    db.log_event(kind, json.dumps({"code": body.get("code"),
-                                   "released": released}, ensure_ascii=False))
+    rev = db.bump_revision(LIVE)
+    db.log_event(LIVE, kind, {"code": body.get("code"), "released": released})
     db.commit()
     return {"type": kind, "revision": rev, "released_for_replan": released}
 
 
 def _cancel_batches_on_road(road_code, reason):
-    cur = db.conn.execute("SELECT id, route FROM batches WHERE status='scheduled'")
+    cur = db.conn.execute(
+        "SELECT id, route FROM batches WHERE world_id=? AND status='scheduled'", (LIVE,))
     ids = [r["id"] for r in cur if road_code in json.loads(r["route"]).get("edges", [])]
     released = []
     for bid in ids:
         hs = [r["household_ref"] for r in db.conn.execute(
-            "SELECT household_ref FROM assignments WHERE batch_id=?", (bid,))]
+            "SELECT household_ref FROM assignments WHERE world_id=? AND batch_id=?",
+            (LIVE, bid))]
         released.extend(hs)
-        db.conn.execute("DELETE FROM assignments WHERE batch_id=?", (bid,))
-        db.conn.execute("UPDATE batches SET status='cancelled' WHERE id=?", (bid,))
+        db.conn.execute("DELETE FROM assignments WHERE world_id=? AND batch_id=?",
+                        (LIVE, bid))
+        db.conn.execute("UPDATE batches SET status='cancelled' WHERE world_id=? AND id=?",
+                        (LIVE, bid))
     if ids:
-        db.log_event("batch_cancelled",
-                     json.dumps({"batches": ids, "released": released,
-                                 "reason": reason}, ensure_ascii=False))
+        db.log_event(LIVE, "batch_cancelled",
+                     {"batches": ids, "released": released, "reason": reason})
     return released
 
 
@@ -492,13 +529,37 @@ class Handler(BaseHTTPRequestHandler):
         p = u.path
         try:
             with db.lock:
+                # ---- 推演分支接口 ----
+                if p == "/api/branches":
+                    return self._json(200, branches.list_branches(db))
+                if p.startswith("/api/branches/"):
+                    parts = p.strip("/").split("/")
+                    bid = parts[2]
+                    if len(parts) == 3:
+                        return self._json(200, branches.get_branch(db, bid))
+                    sub = parts[3]
+                    if sub == "state":
+                        return self._json(200, branches.branch_state(db, bid))
+                    if sub == "diff":
+                        return self._json(200, branches.diff(db, bid))
+                    if sub == "audit":
+                        return self._json(200, branches.branch_audit(db, bid))
+                    if sub == "promotion-check":
+                        ok, info = branches.check_promotion(db, bid)
+                        return self._json(200 if ok else 409, info)
+                    raise branches.NotFound(f"未知分支子接口：{sub}")
+                if p == "/api/branch-audit":
+                    return self._json(200, branches.branch_audit(db))
+
+                # ---- 实战接口 ----
                 if p == "/api/state":
                     return self._json(200, build_state())
                 if p == "/api/plans":
                     return self._json(200, list_plans())
                 if p.startswith("/api/plans/"):
                     pid = p.rsplit("/", 1)[-1]
-                    r = db.conn.execute("SELECT * FROM plans WHERE id=?", (pid,)).fetchone()
+                    r = db.conn.execute("SELECT * FROM plans WHERE world_id=? AND id=?",
+                                        (LIVE, pid)).fetchone()
                     if not r:
                         raise NotFound("方案不存在")
                     d = dict(r)
@@ -506,10 +567,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, d)
                 if p == "/api/events":
                     return self._json(200, [dict(x) for x in db.conn.execute(
-                        "SELECT * FROM event_log ORDER BY id DESC LIMIT 100")])
+                        "SELECT * FROM event_log WHERE world_id=? "
+                        "ORDER BY id DESC LIMIT 100", (LIVE,))])
             if p.startswith("/api/"):
                 raise NotFound("未知接口")
             return self._static(p)
+        except branches.HttpError as e:
+            self._json(e.status, {"error": str(e), **getattr(e, "extra", {})})
         except HttpError as e:
             self._json(e.status, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
@@ -521,7 +585,28 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self._read_body()
             with db.lock:
+                # ---- 推演分支接口 ----
+                if p == "/api/branches":
+                    code, resp = branches.create_branch(db, body or {})
+                    return self._json(code, resp)
+                if p.startswith("/api/branches/"):
+                    parts = p.strip("/").split("/")
+                    bid, sub = parts[2], parts[3] if len(parts) > 3 else ""
+                    if sub == "events":
+                        code, resp = branches.add_event(db, bid, body or {})
+                        return self._json(code, resp)
+                    if sub == "tick":
+                        code, resp = branches.tick(db, bid, body or {})
+                        return self._json(code, resp)
+                    if sub == "promote":
+                        code, resp = branches.promote(db, bid, body or {})
+                        return self._json(code, resp)
+                    if sub == "discard":
+                        code, resp = branches.discard_branch(db, bid, body or {})
+                        return self._json(code, resp)
+                    raise branches.NotFound(f"未知分支操作：{sub}")
 
+                # ---- 实战接口 ----
                 if p == "/api/plan":
                     return self._json(200, create_plan(body or {}))
                 if p == "/api/events":
@@ -543,11 +628,13 @@ class Handler(BaseHTTPRequestHandler):
                 if p == "/api/reset":
                     seed(db, reset=True)
                     db.set_meta("seeded", "1")
-                    db.bump_revision()
-                    db.log_event("reset", "{}")
+                    db.bump_revision(LIVE)
+                    db.log_event(LIVE, "reset", {})
                     db.commit()
-                    return self._json(200, {"ok": True, "revision": db.revision()})
+                    return self._json(200, {"ok": True, "revision": db.revision(LIVE)})
             raise NotFound("未知接口")
+        except branches.HttpError as e:
+            self._json(e.status, {"error": str(e), **getattr(e, "extra", {})})
         except HttpError as e:
             self._json(e.status, {"error": str(e)})
         except ValueError as e:

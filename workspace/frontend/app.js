@@ -2,10 +2,23 @@
 "use strict";
 
 let S = null;
+// 当前上下文：{mode:'live'} 实战，或 {mode:'branch', branch:{...}} 隔离推演
+let CTX = { mode: "live", branch: null };
+const inBranch = () => CTX.mode === "branch" && CTX.branch;
 const WAVE_COLORS = ["#5aa9ff", "#b388ff", "#ffd166", "#4cc38a", "#ff7ab0", "#7be3d4"];
 const waveColor = (w) => WAVE_COLORS[(w - 1) % WAVE_COLORS.length];
 
 const api = async (path, body) => {
+  // —— 分支上下文拦截：任何实战写操作都不允许，统一转到分支或阻止 ——
+  if (inBranch() && body !== undefined) {
+    if (path === "/api/events") {
+      // 地图/侧栏的态势变更 → 入推演队列（不触碰实战）
+      path = `/api/branches/${CTX.branch.id}/events`;
+      body = { ...body };
+    } else if (!path.startsWith("/api/branches/")) {
+      throw new Error("当前处于隔离推演上下文，实战写操作已锁定；如需改动实战请先「返回实战上下文」");
+    }
+  }
   const opt = body === undefined
     ? {}
     : { method: "POST", headers: { "Content-Type": "application/json" },
@@ -34,11 +47,17 @@ const fmtTime = (ts) => new Date(ts * 1000).toLocaleString("zh-CN", { hour12: fa
 async function refresh() {
   try {
     const prevRev = S ? S.revision : null;
-    S = await api("/api/state");
+    const stateUrl = inBranch()
+      ? `/api/branches/${CTX.branch.id}/state` : "/api/state";
+    S = await api(stateUrl);
     document.getElementById("revision").textContent = S.revision;
     const warn = document.getElementById("revWarn");
     warn.hidden = !(prevRev !== null && prevRev !== S.revision);
+    renderContext();
     renderAll();
+    if (document.getElementById("tab-branch").classList.contains("active") && inBranch()) {
+      renderBranchConsole();  // 轻量刷新队列/时钟
+    }
   } catch (e) {
     toast("无法连接服务：" + e.message, "err");
   }
@@ -53,7 +72,56 @@ function renderAll() {
   renderHouseholds();
   renderLog();
   renderPlansList(); // 轻量摘要
+  renderBranchList();
 }
+
+// ---------------------------------------------------------------- 上下文标识
+
+function renderContext() {
+  const pill = document.getElementById("ctxPill");
+  const bar = document.getElementById("ctxBar");
+  const text = document.getElementById("ctxBarText");
+  if (inBranch()) {
+    const b = CTX.branch;
+    document.body.classList.add("ctx-branch");
+    pill.textContent = `🧪 推演 ${b.name}`;
+    pill.className = "ctx-pill branch";
+    bar.hidden = false;
+    bar.className = "ctx-bar branch";
+    text.innerHTML = `🧪 <b>隔离推演上下文：${esc(b.name)}</b>（${esc(b.id)}）` +
+      ` 基线修订号 <b>${b.base_revision}</b> ｜ 当前模拟时钟 T<b>${b.tick ?? S?.revision ?? 0}</b>` +
+      ` ｜ 分支世界修订号 <b>${S?.revision ?? "–"}</b><br>` +
+      `<span class="muted">此处所有写入仅作用于分支副本，不会污染实战；态势变更将进入推演队列。` +
+      `人员去向/资源余量/受阻原因可在「推演沙盘」并排对比。</span>`;
+  } else {
+    document.body.classList.remove("ctx-branch");
+    pill.textContent = "实战 LIVE";
+    pill.className = "ctx-pill live";
+    bar.hidden = true;
+    bar.className = "ctx-bar live";
+    text.textContent = "";
+  }
+}
+
+function enterBranch(branch) {
+  CTX = { mode: "branch", branch };
+  document.querySelectorAll('[data-tab="branch"]').forEach(t => t.classList.add("has-branch"));
+  switchTab("branch");
+  document.getElementById("branchConsole").hidden = false;
+  toast(`已进入隔离推演：${branch.name}`, "ok");
+  refresh();
+  loadBranchDiff();
+}
+
+function exitBranch() {
+  CTX = { mode: "live", branch: null };
+  document.getElementById("branchConsole").hidden = true;
+  selectedBranchId = null;
+  toast("已返回实战上下文", "ok");
+  refresh();
+}
+
+document.getElementById("exitBranchBtn").addEventListener("click", exitBranch);
 
 // ---------------------------------------------------------------- 地图
 
@@ -136,7 +204,10 @@ function renderMap() {
       const type = road.status === "open" ? "road_close" : "road_open";
       try {
         await api("/api/events", { type, code });
-        toast(`道路 ${code} 已${type === "road_close" ? "封闭，仅撤回未出发批次" : "恢复，可继续编排"}`, "ok");
+        toast(inBranch()
+          ? `道路 ${code} 变更已进入推演队列（下个时钟生效，实战不受影响）`
+          : `道路 ${code} 已${type === "road_close" ? "封闭，仅撤回未出发批次" : "恢复，可继续编排"}`,
+          "ok");
         refresh();
       } catch (e) { toast(e.message, "err"); }
     });
@@ -206,7 +277,7 @@ function batchChip(b) {
     return `${esc(h.name || ref)}(${h.members}人${h.mobility ? "♿" : ""}${h.pets ? "🐾" + h.pets : ""})`;
   }).join("、");
   const btn = b.status === "scheduled"
-    ? `<button class="mini publish" onclick="depart('${esc(b.id)}')">确认车辆离场</button>`
+    ? `<button class="mini publish depart-live" onclick="depart('${esc(b.id)}')">确认车辆离场</button>`
     : b.status === "departed"
       ? `<span class="pill departed">✓ 已离场·已承诺</span>`
       : `<span class="pill cancelled">已撤回</span>`;
@@ -278,6 +349,11 @@ async function renderPlansList() {
   const box = document.getElementById("planCompare");
   let plans;
   try { plans = await api("/api/plans"); } catch { return; }
+  if (inBranch()) {
+    box.innerHTML = `<div class="commit-note">🧪 当前为隔离推演上下文：此处展示的仍是<b>实战</b>候选方案，且发布已锁定。
+      推演的调度由「推演沙盘」每个模拟时钟自动生成与执行，请在沙盘中查看逐时钟结果。</div>`;
+    return;
+  }
   if (!plans.length) {
     box.innerHTML = `<p class="muted">尚无候选方案。点击右上角「生成候选方案」，系统将只对
       <b>受威胁网格中尚未出发</b>的家庭求解；已出发承诺保持不变。可多次生成后比较再发布。</p>`;
@@ -462,7 +538,10 @@ const bindEvent = (btnId, selId, type, okMsg) => {
     const code = document.getElementById(selId).value;
     try {
       const r = await api("/api/events", { type, code });
-      toast(okMsg(code) + `（撤回未出发 ${r.released_for_replan.length} 户待重排；已出发不受影响）`, "ok");
+      toast(inBranch()
+        ? `推演事件已入队（${okMsg(code)}，下个时钟生效；实战不受影响）`
+        : okMsg(code) + `（撤回未出发 ${r.released_for_replan.length} 户待重排；已出发不受影响）`,
+        "ok");
       document.querySelectorAll("#roadSel,#vehSel,#shelSel,#gridSel").forEach(el => el.dataset.built = "");
       refresh();
     } catch (e) { toast(e.message, "err"); }
@@ -483,7 +562,9 @@ document.getElementById("fireBtn").addEventListener("click", async () => {
     close_roads: closeRoads.split(",").map(s => s.trim()).filter(Boolean) };
   try {
     const r = await api("/api/events", body);
-    toast(`火线扩大至 ${code}；新增受威胁家庭将进入待编排，撤回未出发 ${r.released_for_replan.length} 户`, "ok");
+    toast(inBranch()
+      ? `推演事件已入队：火线扩大至 ${code}（下个时钟生效）`
+      : `火线扩大至 ${code}；新增受威胁家庭将进入待编排，撤回未出发 ${r.released_for_replan.length} 户`, "ok");
     document.querySelectorAll("#roadSel,#gridSel").forEach(el => el.dataset.built = "");
     refresh();
   } catch (e) { toast(e.message, "err"); }
@@ -492,7 +573,10 @@ document.getElementById("fireBtn").addEventListener("click", async () => {
 // ---------------------------------------------------------------- 日志
 
 function renderLog() {
-  document.getElementById("logList").innerHTML = S.events.slice().reverse().map(e => {
+  const note = inBranch()
+    ? `<div class="commit-note">🧪 隔离推演上下文：此处仍为<b>实战</b>审计流；
+        分支自身的逐时钟与提升审计见「推演沙盘 → 分支审计」。</div>` : "";
+  document.getElementById("logList").innerHTML = note + S.events.slice().reverse().map(e => {
     let detail = "";
     try { detail = JSON.stringify(JSON.parse(e.detail), null, 0); } catch { detail = e.detail; }
     return `<div class="logline"><span class="ts">${fmtTime(e.ts)}</span>
@@ -507,6 +591,286 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
   refresh();
 });
 
+// ---------------------------------------------------------------- 推演沙盘
+
+let selectedBranchId = null;
+let BR_DIFF = null;
+
+async function renderBranchList() {
+  const box = document.getElementById("branchList");
+  if (!box) return;
+  let branches;
+  try { branches = await api("/api/branches"); } catch { return; }
+  if (!branches.length) {
+    box.innerHTML = `<p class="muted">尚无推演分支。填写名称后从当前实战创建一个隔离副本。</p>`;
+    return;
+  }
+  box.innerHTML = branches.map(b => {
+    const stCls = { active: "ok", promoted: "bad", discarded: "warn" }[b.status] || "";
+    const stName = { active: "推演中", promoted: "已提升", discarded: "已废弃" }[b.status];
+    const stale = b.status === "active" && b.stale
+      ? '<span class="tag warn">基线已过期</span>' : "";
+    return `<div class="plan-card ${b.status === selectedBranchId ? "selected" : ""}"
+      onclick="openBranch('${esc(b.id)}')">
+      <div class="row-between"><b>🧪 ${esc(b.name)}</b>
+        <span class="tag ${stCls}">${stName}</span>${stale}</div>
+      <div class="muted">${esc(b.commander || "值班员")} · ${fmtTime(b.created_at)}</div>
+      <div class="metric"><span>创建基线 / 当前实战修订号</span>
+        <b>${b.base_revision} / ${b.live_revision}</b></div>
+      <div class="metric"><span>模拟时钟</span><b>T${b.tick}</b></div>
+    </div>`;
+  }).join("");
+}
+
+document.getElementById("brCreateBtn").addEventListener("click", async () => {
+  const name = document.getElementById("brName").value.trim() || `推演 ${new Date().toLocaleTimeString("zh-CN")}`;
+  const commander = document.getElementById("brCommander").value.trim();
+  try {
+    const b = await api("/api/branches", {
+      name, commander, idempotency_key: "ui-" + Date.now() });
+    document.getElementById("brName").value = "";
+    toast(`已创建隔离分支：${b.name}（基线修订号 ${b.base_revision}）`, "ok");
+    selectedBranchId = b.id;
+    enterBranch(b);
+  } catch (e) { toast(e.message, "err"); }
+});
+
+window.openBranch = async (id) => {
+  try {
+    const b = await api(`/api/branches/${id}`);
+    selectedBranchId = id;
+    if (b.status === "discarded") {
+      // 废弃分支：留在实战上下文，仅展示只读信息（态势/差异已不可用）
+      CTX = { mode: "live", branch: null };
+      document.getElementById("branchConsole").hidden = false;
+      renderContext();
+      renderBranchConsole();
+      document.getElementById("brDiff").innerHTML =
+        '<p class="muted">分支已废弃，其推演世界已清除；审计记录仍可查看。</p>';
+      return;
+    }
+    enterBranch(b);
+  } catch (e) { toast(e.message, "err"); }
+};
+
+function fillBranchEventCodes() {
+  const type = document.getElementById("brEvType").value;
+  const sel = document.getElementById("brEvCode");
+  const val = document.getElementById("brEvVal");
+  const opts = type.startsWith("road")
+    ? S.roads.map(r => `<option value="${esc(r.code)}">${esc(r.code)} ${esc(r.a)}↔${esc(r.b)}</option>`)
+    : type.startsWith("vehicle")
+      ? S.vehicles.map(v => `<option value="${esc(v.code)}">${esc(v.code)} ${esc(v.name)}</option>`)
+      : type.startsWith("shelter")
+        ? S.shelters.map(s => `<option value="${esc(s.code)}">${esc(s.code)} ${esc(s.name)}</option>`)
+        : S.grids.map(g => `<option value="${esc(g.code)}">${esc(g.code)} ${esc(g.name)}</option>`);
+  sel.innerHTML = opts.join("");
+  val.hidden = !(type === "road_set_capacity" || type === "shelter_set_beds");
+  if (type === "road_set_capacity") val.value = "2";
+  if (type === "shelter_set_beds") val.value = "100";
+}
+document.getElementById("brEvType").addEventListener("change", fillBranchEventCodes);
+
+document.getElementById("brEvAddBtn").addEventListener("click", async () => {
+  if (!inBranch()) return;
+  const type = document.getElementById("brEvType").value;
+  const code = document.getElementById("brEvCode").value;
+  const ev = { type, code, idempotency_key: "ev-" + Date.now() };
+  if (type === "road_set_capacity") ev.capacity = Number(document.getElementById("brEvVal").value);
+  if (type === "shelter_set_beds") ev.beds = Number(document.getElementById("brEvVal").value);
+  try {
+    await api(`/api/branches/${CTX.branch.id}/events`, ev);
+    toast(`已入队：${type} ${code}（下个时钟生效，仅作用于分支）`, "ok");
+    renderBranchConsole();
+  } catch (e) { toast(e.message, "err"); }
+});
+
+document.getElementById("brTickBtn").addEventListener("click", async () => {
+  if (!inBranch()) return;
+  const n = Math.max(1, Number(document.getElementById("brTickN").value || 1));
+  try {
+    const r = await api(`/api/branches/${CTX.branch.id}/tick`, {
+      target_tick: (CTX.branch.tick || 0) + n });
+    CTX.branch.tick = r.tick;
+    toast(`已推进到 T${r.tick}`, "ok");
+    await refresh();
+    renderBranchConsole();
+    loadBranchDiff();
+  } catch (e) { toast(e.message, "err"); }
+});
+
+document.getElementById("brDiffBtn").addEventListener("click", loadBranchDiff);
+document.getElementById("brCheckBtn").addEventListener("click", () => promotionCheck(true));
+document.getElementById("brPromoteBtn").addEventListener("click", promoteBranch);
+document.getElementById("brDiscardBtn").addEventListener("click", discardBranch);
+
+function renderBranchConsole() {
+  if (!selectedBranchId) return;
+  (async () => {
+    let b;
+    try { b = await api(`/api/branches/${selectedBranchId}`); }
+    catch { return; }
+    if (CTX.mode === "branch" && CTX.branch.id === b.id) {
+      CTX.branch = b; renderContext();
+    }
+    document.getElementById("brTitle").textContent = `分支控制台 — ${b.name}`;
+    document.getElementById("brMeta").innerHTML =
+      `状态 <b class="ctx-text-${b.status}">${({active:"推演中",promoted:"已提升",discarded:"已废弃"})[b.status]}</b>` +
+      ` ｜ 创建基线修订号 <b>${b.base_revision}</b> ｜ 实战当前 <b>${b.live_revision}</b>` +
+      ` ｜ 时钟 <b>T${b.tick}</b>` + (b.live_revision !== b.base_revision
+        ? ' ｜ <span class="tag warn">基线已过期：实战已推进，提升将被拒绝</span>' : "");
+    const readonly = b.status !== "active";
+    ["brTickBtn", "brEvAddBtn", "brPromoteBtn"].forEach(id =>
+      document.getElementById(id).disabled = readonly);
+    fillBranchEventCodes();
+    const pending = b.pending_events || [];
+    document.getElementById("brPending").innerHTML = pending.length
+      ? "待执行事件：" + pending.map(e =>
+          `<span class="tag warn">T${e.at_tick} ${esc(e.type)} ${esc(e.code || "")}</span>`).join(" ")
+      : "待执行事件：无（可在左侧注入，或直接推进模拟）";
+    const steps = (b.last_tick_result && b.last_tick_result.steps) || [];
+    document.getElementById("brSteps").innerHTML = steps.length
+      ? steps.slice().reverse().map(s => `<div class="wave-block">
+        <div class="wave-title">T${s.tick} ${s.feasible ? "✅ 可调度" : "❌ 受阻"}
+          <span class="muted">｜事件 ${s.events.map(e => esc(e.type)).join("、") || "无"}
+          ｜批次 ${s.batch_count}｜离场 ${s.departed_batch_count}｜未安置 ${s.unassigned.length}</span></div>
+        ${s.unassigned.length ? s.unassigned.map(u =>
+          `<div class="reason"><b>${esc(u.ref)}</b>：${esc((u.reasons || [""])[0])}</div>`).join("") : ""}
+      </div>`).join("")
+      : '<p class="muted">尚未推进模拟。</p>';
+    loadBranchAudit();
+  })();
+}
+
+async function loadBranchDiff() {
+  if (!selectedBranchId) return;
+  const box = document.getElementById("brDiff");
+  try {
+    const d = await api(`/api/branches/${selectedBranchId}/diff`);
+    BR_DIFF = d;
+    const hhName = (ref) => {
+      const h = (S && S.households.find(x => x.ref === ref)) || {};
+      return h.name || ref;
+    };
+    const dest = (x) => !x ? "–" :
+      ({ unplanned: "待安排", scheduled: `已排→${x.shelter || ""}（波${x.wave ?? "–"}）`,
+         departed: `已离场→${x.shelter || ""}（波${x.wave ?? "–"}）` })[x.status] || x.status;
+    let html = `<div class="metric"><span>差异计数</span><b>人员 ${d.counts.people_diff} ·
+      资源 ${d.counts.resource_diff} · 受阻 ${d.counts.blocked_diff} · 可提升 ${d.counts.promotable}</b></div>`;
+
+    html += `<h3>可提升的资源改动（三方预检）</h3>` + (d.promotable_changes.length
+      ? `<table class="grid-table"><tr><th>对象</th><th>字段</th><th>基线</th>
+          <th>推演</th><th>实战当前</th><th>结论</th></tr>` +
+        d.promotable_changes.map(c => `<tr>
+          <td>${esc(c.kind)}/${esc(c.code)}</td><td>${esc(c.field)}</td>
+          <td>${esc(c.baseline)}</td><td><b>${esc(c.branch)}</b></td>
+          <td>${esc(c.live)}</td>
+          <td>${c.conflicts_with_live ? '<span class="tag bad">冲突</span>'
+            : '<span class="tag ok">可应用</span>'}</td></tr>`).join("") + "</table>"
+      : '<p class="muted">无相对基线的净资源改动（中断均已恢复或尚未设置）。</p>');
+
+    html += `<h3>人员去向差异（分支 vs 实战）</h3>` + (d.people_destinations.length
+      ? `<table class="grid-table"><tr><th>户</th><th>实战</th><th>推演</th></tr>` +
+        d.people_destinations.map(p => `<tr><td>${esc(p.ref)} ${esc(p.name || "")}</td>
+          <td>${esc(dest(p.live))}</td><td><b>${esc(dest(p.branch))}</b></td></tr>`).join("")
+        + "</table>"
+      : '<p class="muted">人员去向一致。</p>');
+
+    html += `<h3>资源余量差异</h3>` + (d.resource_remaining.length
+      ? `<table class="grid-table"><tr><th>资源</th><th>实战</th><th>推演</th></tr>` +
+        d.resource_remaining.map(r => `<tr><td>${esc(r.kind)}/${esc(r.code)} ${esc(r.name || "")}</td>
+          <td>${esc(JSON.stringify(r.live))}</td><td><b>${esc(JSON.stringify(r.branch))}</b></td></tr>`
+        ).join("") + "</table>"
+      : '<p class="muted">资源余量一致。</p>');
+
+    html += `<h3>受阻原因差异</h3>` + (d.blocked_reasons.length
+      ? d.blocked_reasons.map(x => `<div class="reason"><b>${esc(x.ref)}</b><br>
+          <span class="muted">实战：</span>${esc((x.live || []).join("；") || "无/已安置")}<br>
+          <span class="muted">推演：</span>${esc((x.branch || []).join("；") || "无/已安置")}</div>`
+        ).join("")
+      : '<p class="muted">当前态势下受阻原因一致（或均已撤离）。</p>');
+    box.innerHTML = html;
+  } catch (e) { box.innerHTML = `<p class="reason">${esc(e.message)}</p>`; }
+}
+
+async function promotionCheck(verbose) {
+  try {
+    const r = await fetch(`/api/branches/${selectedBranchId}/promotion-check`);
+    const info = await r.json();
+    const box = document.getElementById("brPromote");
+    if (r.ok && info.ok) {
+      box.innerHTML = `<div class="commit-note">✅ 预检通过：可提升 ${info.changes.length} 项资源改动，
+        基线修订号 ${info.base_revision} 与实战一致。<br><span class="muted">
+        ${esc(info.excluded)}</span></div>`;
+      if (verbose) toast("预检通过，可以提升", "ok");
+    } else {
+      box.innerHTML = renderReject(info);
+      if (verbose) toast("预检未通过（存在冲突或基线过期）", "err");
+    }
+    return info;
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function renderReject(info) {
+  const conf = (info.conflicts || []).map(c =>
+    `<tr><td>${esc(c.kind)}/${esc(c.code)}</td><td>${esc(c.field)}</td>
+      <td>${esc(c.baseline)}</td><td>${esc(c.live)}</td><td>${esc(c.branch)}</td>
+      <td><span class="tag bad">${esc(c.reason || "冲突")}</span></td></tr>`).join("");
+  return `<div class="unassigned-box"><h4>⛔ 提升被整体拒绝${info.stale ? "（基线已过期）" : "（存在三方冲突）"}</h4>
+    <div class="reason">创建基线修订号 ${info.base_revision ?? "–"}，实战当前 ${info.live_revision ?? "–"}。
+      任一冲突或过期都会拒绝全部改动，未写入实战。</div>
+    ${conf ? `<table class="grid-table"><tr><th>对象</th><th>字段</th><th>基线</th>
+      <th>实战</th><th>推演</th><th>原因</th></tr>${conf}</table>` : ""}
+    <div class="muted">${esc(info.excluded || "")}</div></div>`;
+}
+
+async function promoteBranch() {
+  if (!inBranch()) return;
+  const info = await promotionCheck(false);
+  if (!info) return;
+  if (!info.ok) { toast("预检未通过，已列出冲突/过期对象与字段", "err"); return; }
+  if (!confirm(`确认提升 ${info.changes.length} 项资源改动到实战？\n` +
+      "仅应用资源配置；推演的命令、离场记录、已承诺占用一律不带入。")) return;
+  try {
+    const r = await api(`/api/branches/${selectedBranchId}/promote`, {
+      idempotency_key: "prom-" + Date.now() });
+    document.getElementById("brPromote").innerHTML =
+      `<div class="commit-note">✅ 已提升 ${r.applied_count} 项，实战修订号 ${r.revision}。<br>
+        <span class="muted">${esc(r.excluded)}</span></div>`;
+    toast("提升成功", "ok");
+    await renderBranchList();
+    exitBranch();
+  } catch (e) {
+    document.getElementById("brPromote").innerHTML =
+      `<div class="unassigned-box"><h4>提升被拒绝</h4><div class="reason">${esc(e.message)}</div></div>`;
+    toast(e.message, "err");
+  }
+}
+
+async function discardBranch() {
+  if (!selectedBranchId) return;
+  if (!confirm("确认废弃该推演分支？分支世界将被清除（审计与元数据保留）。")) return;
+  try {
+    await api(`/api/branches/${selectedBranchId}/discard`,
+      { idempotency_key: "disc-" + Date.now() });
+    toast("分支已废弃", "ok");
+    if (inBranch()) exitBranch();
+    await renderBranchList();
+    document.getElementById("branchConsole").hidden = true;
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function loadBranchAudit() {
+  try {
+    const au = await api(`/api/branches/${selectedBranchId}/audit`);
+    document.getElementById("brAudit").innerHTML = au.slice(0, 30).map(e =>
+      `<div class="logline"><span class="ts">${fmtTime(e.ts)}</span>
+        <span class="kind">${esc(e.kind)}</span>
+        <span class="muted">[${esc(e.world === "live" ? "实战" : "分支")} r${e.revision}]</span>
+        ${esc(JSON.stringify(e.detail))}</div>`).join("");
+  } catch { /* ignore */ }
+}
+
 // ---------------------------------------------------------------- 框架
 
 function switchTab(name) {
@@ -514,6 +878,7 @@ function switchTab(name) {
   document.querySelectorAll(".tabpanel").forEach(p =>
     p.classList.toggle("active", p.id === `tab-${name}`));
   if (name === "plans") renderPlansList();
+  if (name === "branch") { renderBranchList(); if (selectedBranchId) renderBranchConsole(); }
 }
 document.querySelectorAll(".tab").forEach(t =>
   t.addEventListener("click", () => switchTab(t.dataset.tab)));
