@@ -115,6 +115,42 @@ CREATE TABLE IF NOT EXISTS event_log(
   detail  TEXT NOT NULL,
   revision INTEGER NOT NULL
 );
+
+-- ===================== 推演分支（隔离沙盒） =====================
+-- 分支元数据保存在实战库；分支的业务数据在独立 SQLite 文件中（物理隔离）。
+CREATE TABLE IF NOT EXISTS branches(
+  id                 TEXT PRIMARY KEY,
+  name               TEXT NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'active', -- active | discarded
+  base_live_revision INTEGER NOT NULL,   -- 创建时实战修订号（创建基线）
+  base_fingerprint   TEXT NOT NULL,      -- 创建基线资源指纹（永不改写，审计用）
+  baseline_fingerprint TEXT NOT NULL,    -- 三方合并所用 merge-base（提升成功后刷新）
+  baseline_revision  INTEGER NOT NULL,   -- merge-base 对应的实战修订号
+  db_file            TEXT NOT NULL,      -- 分支独立数据库文件（相对/绝对路径）
+  idem_key           TEXT UNIQUE,        -- 创建幂等键
+  created_at         REAL NOT NULL,
+  discarded_at       REAL
+);
+
+-- 分支生命周期审计（创建/废弃/提升的尝试与结果，重启后仍可查）
+CREATE TABLE IF NOT EXISTS branch_audit(
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts          REAL NOT NULL,
+  branch_id   TEXT NOT NULL,
+  action      TEXT NOT NULL,             -- create | simulate | promote_ok | promote_rejected | discard
+  detail      TEXT NOT NULL,
+  op_id       TEXT
+);
+
+-- 幂等操作记录：模拟写操作（op_id）与提升（promote_id）的请求/响应
+CREATE TABLE IF NOT EXISTS sim_ops(
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope      TEXT NOT NULL,              -- 分支 id（或 'live'）
+  op_id      TEXT NOT NULL,
+  response   TEXT NOT NULL,
+  ts         REAL NOT NULL,
+  UNIQUE(scope, op_id)
+);
 """
 
 

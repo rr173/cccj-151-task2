@@ -24,6 +24,9 @@ def seed(db, reset=False):
             for t in ("assignments", "batches", "orders", "plans", "event_log",
                       "households", "vehicles", "roads", "shelters", "grids"):
                 c.execute(f"DELETE FROM {t}")
+            # 分支沙盒是独立生命周期：重置实战时一并清空分支元数据、审计与幂等凭证
+            for t in ("sim_ops", "branch_audit", "branches"):
+                c.execute(f"DELETE FROM {t}")
             c.execute("UPDATE meta SET value='0' WHERE key='revision'")
 
         grids = [

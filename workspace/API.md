@@ -59,7 +59,61 @@
 返回均含 `revision` 与 `released_for_replan`（被撤回待重排的户号）。
 
 ### 运维
-- `POST /api/reset` — 清空并恢复演示数据。
+- `POST /api/reset` — 清空并恢复演示数据（同时清空推演分支元数据与分支库文件）。
+
+## 推演分支（隔离沙盒）
+
+分支是**独立 SQLite 文件**（创建时对实战库做完整物理备份）。分支下的所有写操作
+只落在分支库，实战库不受任何影响；提升(promote)是唯一把推演资源改动合并回实战的通道。
+分支地址统一为 `/api/branches/{id}/...`；分支内写接口体可带 `op_id`（客户端生成的
+幂等键），相同 `op_id` 的重试返回首次结果，不重复执行。
+
+### 分支管理
+- `POST /api/branches` `{"name","idem_key?"}`
+  - 从**当前实战态势**复制出隔离分支；返回 `id`、`base_live_revision`（创建基线修订号）。
+  - `idem_key` 相同的重复创建返回同一分支（`idempotent_replay:true`）。
+- `GET /api/branches` — 分支列表（id/name/status/创建基线/上次提升修订号/时间）。
+- `POST /api/branches/{id}/discard` — 废弃分支（幂等）。废弃后禁止再写；
+  分支文件与审计保留，差异仍可只读查看。
+- `GET /api/branches/{id}/audit` — 分支生命周期审计
+ （create / simulate / promote_ok / promote_rejected / discard，含操作细节与 op_id）。
+
+### 分支内连续模拟（全部隔离、幂等、可重启恢复）
+分支支持的写接口与实战同构（路径前加 `/api/branches/{id}`）：
+- `POST /api/branches/{id}/events`（态势事件，体可含 `op_id`）
+- `POST /api/branches/{id}/plan`
+- `POST /api/branches/{id}/plans/{pid}/publish`
+- `POST /api/branches/{id}/batches/{bid}/depart`
+
+只读：`GET .../state`、`GET .../plans`、`GET .../plans/{pid}`、`GET .../events`。
+返回体带 `context:{kind:"branch",id,name,...}` 以明确上下文。
+
+### 并排差异
+- `GET /api/branches/{id}/diff`
+  - `people[]`：每户在实战/推演的去向（status/shelter/wave，`differs` 标记）；
+  - `shelters[]`：两侧床位 `beds/committed/reserved/remaining/status`；
+  - `blockers[]`：两侧最新方案的受阻原因（按户）；
+  - `resource_fields[]`：三方（base/live/branch）逐字段判定
+    （`branch_only` 可提升 / `live_only` / `same_change` / `commitment` / `conflict`）；
+  - 附双方修订号、命令数、已离场/待安排户数汇总。
+
+### 提升（三方冲突检查）
+- `POST /api/branches/{id}/promote`
+  `{"expected_live_revision":<打开差异时看到的实战修订号>, "promote_id":"<幂等键>"}`
+  - **按创建基线**对每个被跟踪字段（道路 status/capacity、避难点 status/beds、
+    车辆 status、网格 threatened）做 base/实战/推演三方比较：
+    - 仅推演改过（实战相对基线未动）→ 干净改动，应用；
+    - 两边改成相同值 → 无冲突、无需应用；
+    - 两边都改且值不同 → 冲突；
+  - `expected_live_revision` 与当前实战修订号不一致 → **过期基线，409 stale_baseline**；
+  - 存在任一冲突 → **整体拒绝（409 conflict）**，不写任何实战数据；
+    返回 `conflict_objects`（`表:编号`）与 `conflicts[]`（对象、字段、base/live/branch 三值），
+    以及 `pending_clean_changes`；
+  - 成功时返回 `applied_fields`、新 `revision`、因状态变化而撤回待重排的户、
+    `skipped_commitments`；
+  - **只迁移资源字段**：推演产生的命令、批次、离场记录、已承诺床位/车辆占用永不带入实战
+    （分支内车辆 `departed` 标记为 `commitment` 自动忽略）；
+  - 相同 `promote_id` 重放返回首次结果（成功或被拒），凭证持久化、重启后仍有效。
 
 ## 硬约束（规划器与发布前校验器双重保证）
 
